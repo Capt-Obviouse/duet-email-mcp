@@ -1,0 +1,9 @@
+[project]
+name = "duet-email-mcp"
+version = "0.0.0"
+requires-python = ">=3.12,<3.13"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+addopts = "-q"
