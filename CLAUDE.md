@@ -4,7 +4,7 @@ MCP server that gives an AI assistant read and draft access to **several mailbox
 owns**, over IMAP/SMTP with per-account app passwords, on AWS Lambda. **Public from day one**
 (MIT): every committed file must be safe to publish.
 
-Status: planning. No application code yet. The first step is the EML-001 architect spike.
+Status: planning. No application code yet. EML-001 (architecture spike) is done; next is EML-002.
 
 ## Branching
 - **Main branch:** `master` (trunk-based; no dev branch). Feature branches `feature/EML-00N-desc`
@@ -58,11 +58,19 @@ Status: planning. No application code yet. The first step is the EML-001 archite
     container; all-mailbox searches fan out with a per-mailbox timeout and an overall deadline,
     returning partial results with `truncated` and a note (same pattern as the calendar search).
 
-## Open questions (for EML-001, ask the operator through the asks queue)
-- Which mailboxes are personal Gmail vs Google Workspace (and is the operator the Workspace
-  admin, so IMAP/app passwords can be allowed)? Any non-Google providers?
-- Cognito: own pool per stack, or optional reuse of an existing pool?
-- Draft-only forever, or plan for `send_message`?
+## Decided (EML-001 questions, operator answers 2026-11-19)
+13. **Mailbox mix:** consumer Gmail, Google Workspace where the operator is the admin (so IMAP and
+    app passwords can be allowed), and iCloud Mail. The design must work for all three.
+14. **Cognito:** the template creates its own pool by default. An optional `ExistingUserPoolId`
+    parameter (plus the pool's domain) makes the stack add its own resource server (`mail.read`,
+    `mail.draft`) and app clients to an existing pool, so an operator running a sibling MCP stack can
+    sign in once. Only the pool is shared; Lambda, IAM, secrets, SSM and Function URL stay separate.
+    Caveats: deploy order and dependence on the pool-owning stack, pool-wide settings shared (MFA
+    must stay required), scopes per resource server keep services isolated. The verifier stays
+    pool-agnostic.
+15. **Draft-only.** No send tool is planned (`send_draft` not planned; revisit only if the operator
+    raises it). Reserved seams stay as designed in the architecture doc.
+16. **Credentials:** one JSON secret for now (supersedes the "EML-001 decides" note in decision 10).
 
 ## Workflow
 - The operator's global CLAUDE.md applies: orchestrator delegates to agents, one at a time unless
