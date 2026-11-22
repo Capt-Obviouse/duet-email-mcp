@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  duet-email-mcp - MCP server with read and draft access to the operator's own mailboxes over IMAP.
+
+Parameters:
+  SsmPrefix:
+    Type: String
+    Default: /duet-email-mcp
+    AllowedPattern: "^/[A-Za-z0-9_.-]+$"
+    Description: SSM path holding api-key (SecureString you create), accounts and client-limits (no trailing slash).
+  Accounts:
+    Type: String
+    Default: "{}"
+    MinLength: 2
+    MaxLength: 4096
+    Description: >-
+      Mailbox configuration, stored in the SSM String parameter <SsmPrefix>/accounts. One JSON
+      object keyed by account alias (lower case, digits, hyphens), e.g.
+      {"personal": {"provider": "google", "address": "me@example.com"}}. No passwords here.
+      Its keys are the allowlist. "{}" allows no mailbox; any malformed entry disables all of them.
+  ClientLimits:
+    Type: String
+    Default: "{}"
+    MinLength: 2
+    MaxLength: 4096
+    Description: >-
+      Optional per-client limits, stored in the SSM String parameter <SsmPrefix>/client-limits.
+      One JSON object keyed by client id, e.g. {"api-key": {"accounts": ["personal"], "access": "draft"}}.
+      An entry only narrows; "accounts": [] locks that client out. The API key client (api-key) is
+      read only unless its entry says "access": "draft". Malformed JSON denies all access.
+  EnableApiKey:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Accept the API key (X-API-Key, or a non-JWT Authorization Bearer) as the client api-key.
+      "false" rejects it with 401 without reading SSM.
+  ReservedConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Caps containers, and so concurrent IMAP sessions per mailbox (Gmail allows 15).
+  FunctionName:
+    Type: String
+    Default: duet-email-mcp
+    AllowedPattern: "^[A-Za-z0-9_-]{1,64}$"
+    Description: Lambda function name (the log group is /aws/lambda/<name>; the secret is <name>/mailbox-credentials).
+  LogRetentionDays:
+    Type: Number
+    Default: 400
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: CloudWatch retention for the function log group (the audit trail lives here).
+
+Resources:
+  # Mailbox configuration, read by the function at request time (cached 60 s). Edit through the
+  # template parameters: a hand edit in SSM works within a minute but drifts from the stack.
+  AccountsParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${SsmPrefix}/accounts"
+      Type: String
+      Value: !Ref Accounts
+      Description: duet-email-mcp mailbox configuration (JSON keyed by alias; no secrets).
+
+  ClientLimitsParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${SsmPrefix}/client-limits"
+      Type: String
+      Value: !Ref ClientLimits
+      Description: duet-email-mcp per-client mailbox limits (JSON keyed by client id).
+
+  # App passwords: one JSON secret {"<alias>": "<app password>"}, created empty. Fill it with
+  #   aws secretsmanager put-secret-value --secret-id <FunctionName>/mailbox-credentials --secret-string file://creds.json
+  # Do not change this resource's properties after filling it: an update to the resource can
+  # write SecretString back to "{}". Passwords never go into a template parameter.
+  CredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${FunctionName}/mailbox-credentials"
+      Description: duet-email-mcp mailbox app passwords, keyed by account alias.
+      SecretString: "{}"
+
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${FunctionName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  MailFunction:
+    Type: AWS::Serverless::Function
+    # The code fails closed without the parameters: create them first.
+    DependsOn: [AccountsParam, ClientLimitsParam]
+    Properties:
+      FunctionName: !Ref FunctionName
+      CodeUri: src/
+      Handler: app.main.handler
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: 1024   # CPU scales with memory: SDK import and parallel TLS handshakes
+      Timeout: 30
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      # No VpcConfig on purpose: mail hosts are public and a VPC would need a NAT gateway.
+      LoggingConfig:
+        LogGroup: !Ref FunctionLogGroup
+      Environment:
+        Variables:
+          SSM_PREFIX: !Ref SsmPrefix
+          CREDENTIALS_SECRET_ARN: !Ref CredentialsSecret
+          ENABLE_API_KEY: !Ref EnableApiKey
+      FunctionUrlConfig:
+        AuthType: NONE   # the app checks the API key itself, before any downstream call
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadOwnParameters  # api-key, accounts, client-limits
+              Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/*"
+            - Sid: DecryptViaSsmWithManagedKey  # the api-key SecureString only
+              Effect: Allow
+              Action: kms:Decrypt
+              Resource: !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                ForAnyValue:StringEquals:
+                  kms:ResourceAliases: alias/aws/ssm
+                StringLike:
+                  kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/*"
+            - Sid: ReadMailboxCredentials  # this one secret; aws/secretsmanager needs no KMS statement
+              Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref CredentialsSecret
+
+Outputs:
+  FunctionUrl:
+    Description: Base URL (append mcp for the MCP endpoint).
+    Value: !GetAtt MailFunctionUrl.FunctionUrl
+  McpUrl:
+    Description: The MCP URL to enter in the MCP client.
+    Value: !Sub "${MailFunctionUrl.FunctionUrl}mcp"
+  FunctionName:
+    Value: !Ref MailFunction
+  CredentialsSecretName:
+    Description: 'Secret to fill with {"<alias>": "<app password>"} (the value is never an output).'
+    Value: !Sub "${FunctionName}/mailbox-credentials"
+  ApiKeyParameter:
+    Description: Create this SecureString yourself (aws ssm put-parameter --type SecureString).
+    Value: !Sub "${SsmPrefix}/api-key"
