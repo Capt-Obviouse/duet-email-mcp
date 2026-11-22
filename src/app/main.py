@@ -40,6 +40,8 @@ from .ssm_params import ApiKeyStore, ParameterReader
 MCP_PATH = "/mcp"
 PUBLIC_PATHS = {(method, "/health") for method in ("GET", "HEAD")}
 RETRY_AFTER_SECONDS = "30"
+# On every response: JSON only, never cached by a browser or proxy.
+RESPONSE_HEADERS = {"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"}
 # The access line's ``path`` for a request that matches no route (the raw path is never logged).
 UNMATCHED_PATH = "<unmatched>"
 
@@ -61,9 +63,9 @@ def _error(status: int, detail: str, headers: dict[str, str] | None = None) -> J
     return JSONResponse(status_code=status, content={"detail": detail}, headers=headers)
 
 
-def _auth_unavailable(reason: str) -> JSONResponse:
-    if reason == "api_key_unconfigured":
-        return _error(503, "API key is not configured on the server")
+def _auth_unavailable() -> JSONResponse:
+    # One text for every cause (no key configured, SSM outage, no JWT verifier), so an anonymous
+    # caller learns nothing about the deployment; the access line's ``reason`` tells the operator.
     return _error(503, "authentication is temporarily unavailable; retry later", {"Retry-After": RETRY_AFTER_SECONDS})
 
 
@@ -159,7 +161,7 @@ def create_app(
                     verified, token = await deps.authenticator.authenticate(request.headers)
                 except AuthUnavailable as exc:
                     auth_kind, reason = _presented_auth(request), exc.reason
-                    response = _auth_unavailable(exc.reason)
+                    response = _auth_unavailable()
                     status = response.status_code
                     return response
                 except TokenRejected as exc:
@@ -196,6 +198,14 @@ def create_app(
                 line["reason"] = audit.reason_code(reason)
             line["ms"] = round((time.perf_counter() - started) * 1000, 1)
             logger.info(json.dumps(line))
+
+    # Registered last, so it wraps the auth middleware and covers every response, 401s included.
+    @app.middleware("http")
+    async def response_headers(request: Request, call_next):
+        response = await call_next(request)
+        for name, value in RESPONSE_HEADERS.items():
+            response.headers.setdefault(name, value)
+        return response
 
     @app.get("/health", response_model=HealthOut, tags=["meta"])
     def health() -> HealthOut:

@@ -7,7 +7,14 @@ read all reach ``parse`` as ``None``; the caller decides what that means (the ac
 treats it as "no mailbox").
 
 ``ApiKeyStore`` reads the operator-created SecureString ``<prefix>/api-key`` with decryption,
-cached 15 minutes. CloudFormation cannot create SecureStrings, so the stack does not own it.
+cached 15 minutes. CloudFormation cannot create SecureStrings, so the stack does not own it. A
+missing, failed, throttled or too short (under ``MIN_API_KEY_LENGTH`` characters) read counts as
+"no key" and is cached for ``retry_seconds`` (30 s), so anonymous traffic cannot turn every
+request into an SSM call.
+
+The boto3 clients (here and in ``credentials.py``) use ``AWS_CLIENT_CONFIG``: short connect and
+read timeouts and two attempts, so a stalled AWS API fails in seconds, well inside the 30 s
+Lambda limit, instead of after botocore's 60 s defaults.
 
 Values are never logged; a failed read logs the parameter name and the exception type only.
 Nothing here does I/O until first use.
@@ -27,10 +34,20 @@ ParamFetcher = Callable[[str], "str | None"]
 
 DEFAULT_TTL_SECONDS = 60.0
 API_KEY_PARAM = "api-key"
+# A stored key shorter than this is treated as unconfigured (generate one with `openssl rand -hex 32`).
+MIN_API_KEY_LENGTH = 32
+API_KEY_RETRY_SECONDS = 30.0
 
 logger = logging.getLogger("mail.config")
 
 _client = None
+
+
+def aws_client_config():
+    """botocore ``Config`` for every AWS client here: 2 s connect, 3 s read, at most 2 attempts in total (about 10 s worst case)."""
+    from botocore.config import Config  # provided by the Lambda runtime
+
+    return Config(connect_timeout=2, read_timeout=3, retries={"total_max_attempts": 2, "mode": "standard"})
 
 
 def ssm_client():
@@ -39,7 +56,7 @@ def ssm_client():
     if _client is None:
         import boto3  # provided by the Lambda runtime
 
-        _client = boto3.client("ssm")
+        _client = boto3.client("ssm", config=aws_client_config())
     return _client
 
 
@@ -100,8 +117,10 @@ class ParameterReader:
 class ApiKeyStore:
     """The API key from SSM ``<prefix>/api-key`` (SecureString), cached for ``ttl_seconds``.
 
-    A missing key is re-read on the next request (no negative cache), so creating the
-    parameter takes effect at once; a failed read is treated as missing (503, never a pass).
+    No usable key (missing, empty, shorter than ``MIN_API_KEY_LENGTH``, or a failed read) is
+    cached too, for ``retry_seconds``: creating or fixing the parameter takes effect within that
+    time, and an outage or an unconfigured stack is not re-read on every request. No key is
+    never a pass (503).
     """
 
     def __init__(
@@ -110,11 +129,13 @@ class ApiKeyStore:
         fetch: ParamFetcher | None = None,
         clock: Callable[[], float] = time.monotonic,
         ttl_seconds: float = 900.0,
+        retry_seconds: float = API_KEY_RETRY_SECONDS,
     ):
         self._name = f"{prefix}/{API_KEY_PARAM}"
         self._fetch = fetch or _secure_fetcher
         self._clock = clock
         self._ttl = ttl_seconds
+        self._retry = retry_seconds
         self._lock = threading.Lock()
         self._value: str | None = None
         self._read_at: float | None = None
@@ -122,11 +143,22 @@ class ApiKeyStore:
     def api_key(self) -> str | None:
         with self._lock:
             now = self._clock()
-            if self._value is None or self._read_at is None or now - self._read_at >= self._ttl:
-                try:
-                    self._value = self._fetch(self._name) or None
-                except Exception as exc:
-                    logger.error("ssm parameter read failed: %s %s", self._name, type(exc).__name__)
-                    self._value = None
+            wait = self._ttl if self._value is not None else self._retry
+            if self._read_at is None or now - self._read_at >= wait:
+                self._value = self._read()
                 self._read_at = now
             return self._value
+
+    def _read(self) -> str | None:
+        try:
+            value = self._fetch(self._name) or None
+        except Exception as exc:
+            logger.error("ssm parameter read failed: %s %s", self._name, type(exc).__name__)
+            return None
+        if value is not None and len(value) < MIN_API_KEY_LENGTH:
+            logger.error(
+                "ssm parameter %s is shorter than %d characters; treated as unconfigured",
+                self._name, MIN_API_KEY_LENGTH,
+            )
+            return None
+        return value

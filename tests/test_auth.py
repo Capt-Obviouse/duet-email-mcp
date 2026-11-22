@@ -20,7 +20,9 @@ from app.auth import (
     looks_like_jwt,
 )
 from app.config import Settings
-from conftest import ACCEPT, API_KEY_PARAM, SECRET_ID, TEST_KEY, FakeSSM, make_app, rpc
+from app.main import create_app
+from app.ssm_params import ApiKeyStore, ParameterReader
+from conftest import ACCEPT, API_KEY_PARAM, PREFIX, SECRET_ID, TEST_KEY, FakeSSM, make_app, rpc
 
 JWT = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln"
 
@@ -89,7 +91,30 @@ def test_unconfigured_key_is_503_for_everyone():
     client = TestClient(make_app(FakeSSM({})))
     r = rpc(client, "ping")
     assert r.status_code == 503
-    assert r.json() == {"detail": "API key is not configured on the server"}
+    assert r.json() == {"detail": "authentication is temporarily unavailable; retry later"}
+    assert r.headers["retry-after"] == "30"
+
+
+def test_every_503_cause_has_the_same_body():
+    def boom(name):
+        raise RuntimeError("outage")
+
+    bodies = set()
+    for ssm in (FakeSSM({}), FakeSSM({API_KEY_PARAM: "too-short"}), boom):
+        app = create_app(settings=Settings(credentials_secret_id=SECRET_ID), parameters=ParameterReader(fetch=FakeSSM()),
+                         api_keys=ApiKeyStore(PREFIX, fetch=ssm))
+        r = rpc(TestClient(app), "ping")
+        assert r.status_code == 503
+        bodies.add(r.text)
+    jwt = rpc(TestClient(make_app()), "ping", headers={"Authorization": f"Bearer {JWT}", **ACCEPT})
+    bodies.add(jwt.text)
+    assert len(bodies) == 1
+
+
+def test_responses_carry_nosniff_and_no_store(client, auth):
+    for r in (client.get("/health"), rpc(client, "ping"), rpc(client, "ping", headers=ACCEPT)):
+        assert r.headers["x-content-type-options"] == "nosniff"
+        assert r.headers["cache-control"] == "no-store"
 
 
 def test_disabled_api_key_is_401_without_reading_ssm(ssm):

@@ -1,7 +1,9 @@
 """Mailbox app passwords from one Secrets Manager JSON secret (decision A591).
 
-The secret holds ``{"<alias>": "<app password>", ...}``. The stack creates it as ``{}``; the
-operator fills it with ``aws secretsmanager put-secret-value``. Rules (design section 6):
+The secret holds ``{"<alias>": "<app password>", ...}``. The stack creates it with no value at
+all (so no stack update can ever overwrite the passwords); the operator fills it with
+``aws secretsmanager put-secret-value``. A secret with no value yet reads as
+``ResourceNotFoundException``, which means "no credentials" exactly like an empty secret. Rules (design section 6):
 
 - Read lazily: nothing is fetched until a tool first needs a password (``list_accounts`` never
   does). One ``GetSecretValue`` per container per 15 minutes; after a failed, empty or
@@ -60,7 +62,9 @@ def secrets_client():
     if _client is None:
         import boto3  # provided by the Lambda runtime
 
-        _client = boto3.client("secretsmanager")
+        from .ssm_params import aws_client_config
+
+        _client = boto3.client("secretsmanager", config=aws_client_config())
     return _client
 
 
@@ -68,7 +72,7 @@ def _boto3_fetcher(secret_id: str) -> str | None:
     client = secrets_client()
     try:
         resp = client.get_secret_value(SecretId=secret_id)
-    except client.exceptions.ResourceNotFoundException:
+    except client.exceptions.ResourceNotFoundException:  # no such secret, or no value put yet
         return None
     return resp.get("SecretString") or None
 

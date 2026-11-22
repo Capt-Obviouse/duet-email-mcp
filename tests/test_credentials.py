@@ -125,3 +125,23 @@ def test_nothing_secret_is_ever_logged(fake, caplog):
     assert "hunter2" not in text
     assert SECRET_ID not in text  # the id is an ARN in production (account id)
     assert "personal" not in text
+
+
+def test_secret_without_a_value_reads_as_no_credentials(monkeypatch, caplog):
+    """The stack creates the secret with no value: GetSecretValue raises ResourceNotFoundException."""
+    import boto3
+    from botocore.stub import Stubber
+
+    from app import credentials
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    client = boto3.client("secretsmanager", region_name="us-east-1")
+    with Stubber(client) as stub:
+        stub.add_client_error("get_secret_value", service_error_code="ResourceNotFoundException",
+                              http_status_code=400)
+        monkeypatch.setattr(credentials, "_client", client)
+        with caplog.at_level(logging.ERROR):
+            assert CredentialStore(SECRET_ID).password("personal") is None
+        stub.assert_no_pending_responses()
+    assert "secret is empty" in caplog.text
