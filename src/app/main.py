@@ -202,6 +202,9 @@ def create_app(
         """Liveness check. No auth, no SSM, Secrets Manager or mail call."""
         return HealthOut()
 
+    # HEAD for uptime probes; same handler, kept out of the OpenAPI document.
+    app.add_api_route("/health", health, methods=["HEAD"], include_in_schema=False)
+
     # Every method reaches the endpoint, which answers 405 for anything but POST.
     app.add_route(MCP_PATH, LazyMCPEndpoint(deps.service), include_in_schema=False)
     return app
