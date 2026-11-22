@@ -40,12 +40,18 @@ Parameters:
     Type: Number
     Default: 5
     MinValue: 1
-    Description: Caps containers, and so concurrent IMAP sessions per mailbox (Gmail allows 15).
+    Description: >-
+      Caps containers, and so concurrent IMAP sessions per mailbox (Gmail allows 15). AWS keeps 10
+      executions unreserved per account, so on a new account with a concurrency quota of 10 any
+      reservation fails: request a quota increase first.
   FunctionName:
     Type: String
     Default: duet-email-mcp
     AllowedPattern: "^[A-Za-z0-9_-]{1,64}$"
-    Description: Lambda function name (the log group is /aws/lambda/<name>; the secret is <name>/mailbox-credentials).
+    Description: >-
+      Lambda function name; the log group is /aws/lambda/<name>. The credentials secret is named
+      after the stack (<stack name>/mailbox-credentials), not this, so renaming the function
+      never orphans the passwords.
   LogRetentionDays:
     Type: Number
     Default: 400
@@ -71,19 +77,27 @@ Resources:
       Value: !Ref ClientLimits
       Description: duet-email-mcp per-client mailbox limits (JSON keyed by client id).
 
-  # App passwords: one JSON secret {"<alias>": "<app password>"}, created empty. Fill it with
-  #   aws secretsmanager put-secret-value --secret-id <FunctionName>/mailbox-credentials --secret-string file://creds.json
-  # Do not change this resource's properties after filling it: an update to the resource can
-  # write SecretString back to "{}". Passwords never go into a template parameter.
+  # App passwords: one JSON secret {"<alias>": "<app password>"}. The stack creates it with NO
+  # value (no SecretString), so no stack update can ever overwrite what the operator stored; until
+  # it is filled, reads fail with ResourceNotFoundException and every mailbox is unavailable. Fill
+  # it (and later replace it) with
+  #   aws secretsmanager put-secret-value --secret-id <stack name>/mailbox-credentials --secret-string file://creds.json
+  # The name follows the stack name, which never changes for a stack. Retained on stack deletion
+  # and on replacement: delete it by hand (or reuse it) before creating a new stack of the same name.
+  # Passwords never go into a template parameter.
   CredentialsSecret:
     Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      Name: !Sub "${FunctionName}/mailbox-credentials"
+      Name: !Sub "${AWS::StackName}/mailbox-credentials"
       Description: duet-email-mcp mailbox app passwords, keyed by account alias.
-      SecretString: "{}"
 
+  # The audit trail. Retained on stack deletion; delete it by hand before re-creating the stack.
   FunctionLogGroup:
     Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: !Sub "/aws/lambda/${FunctionName}"
       RetentionInDays: !Ref LogRetentionDays
@@ -111,28 +125,48 @@ Resources:
           ENABLE_API_KEY: !Ref EnableApiKey
       FunctionUrlConfig:
         AuthType: NONE   # the app checks the API key itself, before any downstream call
+      # An explicit role instead of SAM's generated one, whose AWSLambdaBasicExecutionRole could
+      # write to every log group in the account and region.
+      Role: !GetAtt MailFunctionRole.Arn
+
+  MailFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
       Policies:
-        - Version: "2012-10-17"
-          Statement:
-            - Sid: ReadOwnParameters  # api-key, accounts, client-limits
-              Effect: Allow
-              Action: ssm:GetParameter
-              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/*"
-            - Sid: DecryptViaSsmWithManagedKey  # the api-key SecureString only
-              Effect: Allow
-              Action: kms:Decrypt
-              Resource: !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
-              Condition:
-                StringEquals:
-                  kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
-                ForAnyValue:StringEquals:
-                  kms:ResourceAliases: alias/aws/ssm
-                StringLike:
-                  kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/*"
-            - Sid: ReadMailboxCredentials  # this one secret; aws/secretsmanager needs no KMS statement
-              Effect: Allow
-              Action: secretsmanager:GetSecretValue
-              Resource: !Ref CredentialsSecret
+        - PolicyName: mail-function
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteOwnLogGroup  # the log group exists already: no logs:CreateLogGroup
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt FunctionLogGroup.Arn
+              - Sid: ReadOwnParameters  # api-key, accounts, client-limits
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/*"
+              - Sid: DecryptViaSsmWithManagedKey  # the api-key SecureString only
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                  ForAnyValue:StringEquals:
+                    kms:ResourceAliases: alias/aws/ssm
+                  StringLike:
+                    kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/*"
+              - Sid: ReadMailboxCredentials  # this one secret; aws/secretsmanager needs no KMS statement
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref CredentialsSecret
 
 Outputs:
   FunctionUrl:
@@ -144,8 +178,13 @@ Outputs:
   FunctionName:
     Value: !Ref MailFunction
   CredentialsSecretName:
-    Description: 'Secret to fill with {"<alias>": "<app password>"} (the value is never an output).'
-    Value: !Sub "${FunctionName}/mailbox-credentials"
+    Description: >-
+      Secret to fill with {"<alias>": "<app password>"} using aws secretsmanager put-secret-value
+      (created with no value; the value is never an output).
+    Value: !Sub "${AWS::StackName}/mailbox-credentials"
   ApiKeyParameter:
-    Description: Create this SecureString yourself (aws ssm put-parameter --type SecureString).
+    Description: >-
+      Create this SecureString yourself: aws ssm put-parameter --type SecureString --value
+      "$(openssl rand -hex 32)". At least 32 characters and no dots, or the server treats the key as
+      unconfigured (shorter) or as a JWT (two dots).
     Value: !Sub "${SsmPrefix}/api-key"
