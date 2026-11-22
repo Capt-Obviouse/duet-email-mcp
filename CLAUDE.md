@@ -94,15 +94,18 @@ Design: `docs/architecture/EML-001-architecture.md`. What exists (EML-002):
   405). Everything else, including `/docs` and `/openapi.json`, needs a credential.
 - **Middleware (`main.py`):** authenticates every non-public request before any SSM (beyond the
   key), Secrets Manager or mail call; 401 `missing or invalid credentials` with a bare
-  `WWW-Authenticate: Bearer`, 503 when the key is not configured or a JWT arrives with no verifier
-  (`Retry-After: 30`); then refuses a declared body over 256 KiB (413); publishes the caller on
+  `WWW-Authenticate: Bearer`, 503 with one generic body for every cause (key not configured or too
+  short, SSM failure, JWT with no verifier; `Retry-After: 30`; only the access line's `reason`
+  tells them apart); then refuses a declared body over 256 KiB (413); publishes the caller on
   `request.state`, the SDK `auth_context_var` (`auth_context.py`) and `audit.caller()`; writes one
   access line per request (`mail.access`: method, matched route template or `<unmatched>`, status,
   `auth` `api_key`/`oauth`/`none`, `reason` code on rejections, ms). Unhandled exceptions are logged
-  by type name only.
+  by type name only. Every response carries `X-Content-Type-Options: nosniff` and
+  `Cache-Control: no-store`.
 - **Auth (`auth.py`):** API key = SSM SecureString `<prefix>/api-key`, created by the operator
-  (CloudFormation cannot create SecureStrings), read by `ssm_params.ApiKeyStore` (15 min cache; a
-  missing key is re-read on the next request), sent as `X-API-Key` or a non-JWT
+  (CloudFormation cannot create SecureStrings; generate it with `openssl rand -hex 32`), read by
+  `ssm_params.ApiKeyStore` (15 min cache; a missing, failed or shorter-than-32-character key counts
+  as unconfigured and is cached 30 s, so a new key works within 30 s), sent as `X-API-Key` or a non-JWT
   `Authorization: Bearer`, compared only by `key_matches` (`hmac.compare_digest`). `X-API-Key`
   wins whenever present (even empty); `Authorization` must be exactly `Bearer <token>`; a
   JWT-shaped bearer goes only to the `JwtVerifier` seam and never to the key. The key is client
@@ -113,24 +116,26 @@ Design: `docs/architecture/EML-001-architecture.md`. What exists (EML-002):
   never imports the SDK at import time.
 - **Account config and limits (`accounts.py`):** two stack-created SSM Strings fed by the template
   parameters `Accounts` and `ClientLimits` (default `{}`), read through `ssm_params.ParameterReader`
-  (parsed value cached 60 s). `<prefix>/accounts`: JSON keyed by alias (`^[a-z0-9][a-z0-9-]{0,31}$`),
+  (parsed value cached 60 s; a denying result from a malformed document is cached too). `<prefix>/accounts`: JSON keyed by alias (`^[a-z0-9][a-z0-9-]{0,31}$`),
   fields `provider` (`google`/`gmail`/`workspace`, `icloud`, `generic`), `address`, optional
   `username`, `description` (80 chars), `imap` and `smtp` (`host`, `port`, `tls`
   `implicit`/`starttls`; required for `generic`, else overriding the preset field by field),
   `folders` (logical `inbox`/`sent`/`drafts`/`all_mail` to real names). Presets: Google
   (`imap.gmail.com`, `[Gmail]/...` folders, search `gmail`), iCloud (`imap.mail.me.com`,
   `Sent Messages`, `Drafts`). Any unknown field, duplicate key, wrong type, control character,
-  bad alias, host, port or tls disables **every** mailbox. `<prefix>/client-limits`:
+  bad alias, host, port or tls disables **every** mailbox (the loaders also catch any
+  `TypeError`/`ValueError`/`RecursionError` and deny). `<prefix>/client-limits`:
   `{"<client_id>": {"accounts": [...], "access": "read"|"draft"}}`; missing or malformed denies
   every client. `AccountAccess.grant(client_id, token_scopes)` returns a `Grant`: accounts = global
   list intersected with the entry, in config order (never wider; `[]` locks out); scopes = token
   scopes capped by `access` (`read` -> `mail.read`; `draft` -> both; no entry: `read` for
   `api-key`, uncapped for other clients). No scope means no accounts. Errors log the parameter name
   only.
-- **Credentials (`credentials.py`):** one Secrets Manager secret `<FunctionName>/mailbox-credentials`
-  (`CREDENTIALS_SECRET_ARN`), JSON `{"<alias>": "<app password>"}`, created as `{}` by the stack and
-  filled by the operator with `put-secret-value` (never a template parameter; do not change the
-  resource's properties after filling it). `CredentialStore` reads it on first need only, caches 15
+- **Credentials (`credentials.py`):** one Secrets Manager secret `<stack name>/mailbox-credentials`
+  (`CREDENTIALS_SECRET_ARN`), JSON `{"<alias>": "<app password>"}`, created by the stack **with no
+  value** (no `SecretString`, so no update can overwrite it; `DeletionPolicy`/`UpdateReplacePolicy`
+  Retain) and filled by the operator with `put-secret-value` (never a template parameter). Until it
+  is filled, `GetSecretValue` raises `ResourceNotFoundException`, read as no credentials. `CredentialStore` reads it on first need only, caches 15
   min, waits 60 s after a failed, empty or unparsable read, and wraps values in `Secret` (redacted
   `repr`/`str`, not picklable, `reveal()` for the login call only). `forget(alias)` drops one.
   Logs never include values, keys, the secret id or exception text. `MailService.password_for`
@@ -150,20 +155,28 @@ Design: `docs/architecture/EML-001-architecture.md`. What exists (EML-002):
   credential, no cookies). `SERVER_INSTRUCTIONS` is the design section 9 text. Tools:
   `list_accounts` (read-only annotation; returns `account`, `address`, optional `description`,
   `folders`, `search`, `access` for effective accounts; configuration only, no network, no
-  credentials). `MailMCPServer.call_tool` rejects unknown tools (JSON-RPC error that never echoes
+  credentials). `MailMCPServer.call_tool` opens a per-call `audit.AuditNote` (ContextVar), rejects unknown tools (JSON-RPC error that never echoes
   the name) and unknown parameters, turns failures into `isError` results with fixed categories
   (`errors.py`, design 7.5: `"<category>: <hint>"`, optionally the argument *name*), and writes
-  the audit line. A send wrapper scrubs SDK JSON-RPC error bodies; `mcp.*` loggers are at WARNING
-  with a filter that strips arguments and tracebacks. `tools/list` scope filtering is EML-005.
+  the one audit line from the note. A send wrapper scrubs SDK JSON-RPC error bodies; `mcp.*` loggers are at WARNING
+  with a filter that strips arguments and tracebacks (re-applied after the first request). `tools/list` scope filtering is EML-005.
 - **Audit (`audit.py`):** one JSON line per `tools/call` (`mail.audit`), built from an allowlist of
   keys: `event`, `ts`, `client_id`, `auth`, `tool` (`unknown` for a bad name), `account` (a
   configured alias or `*`; `list_accounts` logs `*`), `status` `ok`/`error`/`denied`/`partial`,
   optional `error_class` (a category, `unknown_tool`, `unknown_parameter`, `protocol`, or an
-  exception type name), `ms`, and later `accounts_ok`/`accounts_skipped`. Never subjects, bodies,
+  exception type name), `ms`, `accounts_ok`/`accounts_skipped`. Per-call values come from the
+  service: `audit.note_call(account=<validated alias>, accounts_ok=, accounts_skipped=,
+  partial=True)` writes into the open note (a no-op outside a call); `partial` turns `ok` into
+  status `partial`, never a failure. Never subjects, bodies,
   addresses, search text, ids, argument values, tokens or keys. No audit line for failed auth.
-  Log group `/aws/lambda/<FunctionName>`, retention `LogRetentionDays` (400).
-- **IAM:** `ssm:GetParameter` on `<prefix>/*`; `kms:Decrypt` via SSM on `alias/aws/ssm` only;
-  `secretsmanager:GetSecretValue` on the one secret ARN.
+  Log group `/aws/lambda/<FunctionName>`, retention `LogRetentionDays` (400), retained on stack
+  deletion.
+- **AWS clients:** SSM and Secrets Manager clients share `ssm_params.aws_client_config()`: 2 s
+  connect, 3 s read, 2 attempts in total.
+- **IAM:** an explicit role (`MailFunctionRole`, not SAM's basic execution role):
+  `logs:CreateLogStream`/`PutLogEvents` on the function's own log group only; `ssm:GetParameter` on
+  `<prefix>/*`; `kms:Decrypt` via SSM on `alias/aws/ssm` only; `secretsmanager:GetSecretValue` on
+  the one secret ARN.
 - **Not built yet:** sanitiser (EML-003a), `ImapBackend` and read tools (EML-003b), drafts
   (EML-004), Cognito and RFC 9728 metadata (EML-005).
 
@@ -182,3 +195,5 @@ Design: `docs/architecture/EML-001-architecture.md`. What exists (EML-002):
 - Template: `sam validate --lint` and `sam build` (with Python 3.12 on `PATH`); the build must be
   arm64 only.
 - No CI yet: the local pytest run is the gate.
+- `test_service.py::test_every_tool_declares_its_scopes` compares the registered MCP tools with
+  `TOOL_SCOPES`: a new tool needs an entry there.

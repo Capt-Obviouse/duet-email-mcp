@@ -274,8 +274,9 @@ JSON `{"<client_id>": {"accounts": ["personal-gmail"], "access": "read"}}`, defa
 The memory-exposure difference is weak: the one function role can read any of them, so a code
 execution compromise gets all either way. App passwords do not rotate automatically (providers
 offer no rotation API), so Secrets Manager rotation is not a benefit here. **Recommendation: one
-JSON secret**, `{"<alias>": "<app password>"}`, created empty (`{}`) by the stack, filled with
-`aws secretsmanager put-secret-value`. EML-006 ships a small helper script that does the
+JSON secret**, `{"<alias>": "<app password>"}`, created by the stack with no value (EML-002 review:
+a stack-owned `SecretString` could be written back over the stored passwords; the secret is also
+retained on stack deletion), filled with `aws secretsmanager put-secret-value`. EML-006 ships a small helper script that does the
 read-modify-write for one alias without echoing values. Passwords never enter a CloudFormation
 parameter (they would be stored in the stack).
 

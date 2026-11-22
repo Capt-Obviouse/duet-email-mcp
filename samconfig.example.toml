@@ -19,7 +19,7 @@ fail_on_empty_changeset = false
 tags = "project=\"duet-email-mcp\""
 # Accounts and ClientLimits become the SSM parameters <prefix>/accounts and <prefix>/client-limits.
 # A literal ('...') TOML string keeps the JSON readable: inside it, escape each JSON quote as \".
-# App passwords never go here: put them in the <FunctionName>/mailbox-credentials secret.
+# App passwords never go here: put them in the <stack name>/mailbox-credentials secret.
 # Example with one Gmail account, the API key allowed to draft:
 #   Accounts="{\"personal\": {\"provider\": \"google\", \"address\": \"me@example.com\"}}"
 #   ClientLimits="{\"api-key\": {\"access\": \"draft\"}}"
