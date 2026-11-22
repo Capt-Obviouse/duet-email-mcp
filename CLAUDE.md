@@ -4,7 +4,8 @@ MCP server that gives an AI assistant read and draft access to **several mailbox
 owns**, over IMAP/SMTP with per-account app passwords, on AWS Lambda. **Public from day one**
 (MIT): every committed file must be safe to publish.
 
-Status: planning. No application code yet. EML-001 (architecture spike) is done; next is EML-002.
+Status: early development. EML-001 (design) is done; EML-002 (skeleton: auth, config, credentials
+seam, audit, `list_accounts`) is in review. No mail is read yet (EML-003b).
 
 ## Branching
 - **Main branch:** `master` (trunk-based; no dev branch). Feature branches `feature/EML-00N-desc`
@@ -82,5 +83,117 @@ Status: planning. No application code yet. EML-001 (architecture spike) is done;
 - Before any push to the public repo: scan the diff for personal values.
 
 ## Architecture
-Not built yet. Replace this section with the real architecture as soon as EML-002 lands; keep it
-accurate so every agent can check that its work integrates.
+Design: `docs/architecture/EML-001-architecture.md`. What exists (EML-002):
+
+- **Runtime:** Python 3.12, FastAPI app wrapped by Mangum with lifespan off
+  (`src/app/main.py:handler`) on AWS Lambda arm64, 1024 MB, 30 s, reserved concurrency 5
+  (`ReservedConcurrency`), no VPC, exposed by a Function URL with auth type NONE. Deployed by AWS
+  SAM (`template.yaml`; operator settings in the gitignored `samconfig.toml`, copied from
+  `samconfig.example.toml`). Not deployed yet.
+- **Routes:** `GET`/`HEAD /health` (public, touches nothing) and `/mcp` (POST only; other methods
+  405). Everything else, including `/docs` and `/openapi.json`, needs a credential.
+- **Middleware (`main.py`):** authenticates every non-public request before any SSM (beyond the
+  key), Secrets Manager or mail call; 401 `missing or invalid credentials` with a bare
+  `WWW-Authenticate: Bearer`, 503 with one generic body for every cause (key not configured or too
+  short, SSM failure, JWT with no verifier; `Retry-After: 30`; only the access line's `reason`
+  tells them apart); then refuses a declared body over 256 KiB (413); publishes the caller on
+  `request.state`, the SDK `auth_context_var` (`auth_context.py`) and `audit.caller()`; writes one
+  access line per request (`mail.access`: method, matched route template or `<unmatched>`, status,
+  `auth` `api_key`/`oauth`/`none`, `reason` code on rejections, ms). Unhandled exceptions are logged
+  by type name only. Every response carries `X-Content-Type-Options: nosniff` and
+  `Cache-Control: no-store`.
+- **Auth (`auth.py`):** API key = SSM SecureString `<prefix>/api-key`, created by the operator
+  (CloudFormation cannot create SecureStrings; generate it with `openssl rand -hex 32`), read by
+  `ssm_params.ApiKeyStore` (15 min cache; a missing, failed or shorter-than-32-character key counts
+  as unconfigured and is cached 30 s, so a new key works within 30 s), sent as `X-API-Key` or a non-JWT
+  `Authorization: Bearer`, compared only by `key_matches` (`hmac.compare_digest`). `X-API-Key`
+  wins whenever present (even empty); `Authorization` must be exactly `Bearer <token>`; a
+  JWT-shaped bearer goes only to the `JwtVerifier` seam and never to the key. The key is client
+  `api-key` (`API_KEY_CLIENT_ID`) carrying `mail.read` and `mail.draft`, capped to read by default
+  (below). `EnableApiKey` -> `ENABLE_API_KEY`; `false` is 401 without reading SSM.
+  `ApiKeyVerifier.verify_token` has the SDK `TokenVerifier` shape. EML-005 plugs the Cognito
+  verifier into `create_app(token_verifier=...)`; nothing in the seam names a pool. `auth.py`
+  never imports the SDK at import time.
+- **Account config and limits (`accounts.py`):** two stack-created SSM Strings fed by the template
+  parameters `Accounts` and `ClientLimits` (default `{}`), read through `ssm_params.ParameterReader`
+  (parsed value cached 60 s; a denying result from a malformed document is cached too). `<prefix>/accounts`: JSON keyed by alias (`^[a-z0-9][a-z0-9-]{0,31}$`),
+  fields `provider` (`google`/`gmail`/`workspace`, `icloud`, `generic`), `address`, optional
+  `username`, `description` (80 chars), `imap` and `smtp` (`host`, `port`, `tls`
+  `implicit`/`starttls`; required for `generic`, else overriding the preset field by field),
+  `folders` (logical `inbox`/`sent`/`drafts`/`all_mail` to real names). Presets: Google
+  (`imap.gmail.com`, `[Gmail]/...` folders, search `gmail`), iCloud (`imap.mail.me.com`,
+  `Sent Messages`, `Drafts`). Any unknown field, duplicate key, wrong type, control character,
+  bad alias, host, port or tls disables **every** mailbox (the loaders also catch any
+  `TypeError`/`ValueError`/`RecursionError` and deny). `<prefix>/client-limits`:
+  `{"<client_id>": {"accounts": [...], "access": "read"|"draft"}}`; missing or malformed denies
+  every client. `AccountAccess.grant(client_id, token_scopes)` returns a `Grant`: accounts = global
+  list intersected with the entry, in config order (never wider; `[]` locks out); scopes = token
+  scopes capped by `access` (`read` -> `mail.read`; `draft` -> both; no entry: `read` for
+  `api-key`, uncapped for other clients). No scope means no accounts. Errors log the parameter name
+  only.
+- **Credentials (`credentials.py`):** one Secrets Manager secret `<stack name>/mailbox-credentials`
+  (`CREDENTIALS_SECRET_ARN`), JSON `{"<alias>": "<app password>"}`, created by the stack **with no
+  value** (no `SecretString`, so no update can overwrite it; `DeletionPolicy`/`UpdateReplacePolicy`
+  Retain) and filled by the operator with `put-secret-value` (never a template parameter). Until it
+  is filled, `GetSecretValue` raises `ResourceNotFoundException`, read as no credentials. `CredentialStore` reads it on first need only, caches 15
+  min, waits 60 s after a failed, empty or unparsable read, and wraps values in `Secret` (redacted
+  `repr`/`str`, not picklable, `reveal()` for the login call only). `forget(alias)` drops one.
+  Logs never include values, keys, the secret id or exception text. `MailService.password_for`
+  refuses aliases outside the grant before reading.
+- **Service (`service.py`):** `MailService` holds every rule. Each tool resolves the caller's grant
+  once, checks `TOOL_SCOPES[tool]` (any one scope suffices) and that the grant has accounts
+  (`forbidden` otherwise), and will pass `allowed=` aliases to the backend. `backend()` is
+  `unavailable` until EML-003b provides `ImapBackend`.
+- **Backend seam (`backend.py`):** `MailBackend` protocol (`search`, `fetch`, `append_draft`,
+  `close`), each with a required `allowed=` keyword checked again by `ensure_allowed`; result
+  dataclasses carry primitives and raw bytes (`MessageSummary`, `MessageDetail`, `DraftRef`,
+  `SearchCriteria`, `AttachmentInfo`). No implementation ships; tests use `tests/conftest.py`
+  `FakeBackend`. EML-003b may refine the signatures.
+- **MCP (`mcp_server.py`):** official `mcp` SDK 2.3.0 `MCPServer`, stateless streamable HTTP with
+  JSON responses (a fresh session manager per request, no `Mcp-Session-Id`), imported on the first
+  `/mcp` request only (`LazyMCPEndpoint`). DNS-rebinding protection is off (public URL, header
+  credential, no cookies). `SERVER_INSTRUCTIONS` is the design section 9 text. Tools:
+  `list_accounts` (read-only annotation; returns `account`, `address`, optional `description`,
+  `folders`, `search`, `access` for effective accounts; configuration only, no network, no
+  credentials). `MailMCPServer.call_tool` opens a per-call `audit.AuditNote` (ContextVar), rejects unknown tools (JSON-RPC error that never echoes
+  the name) and unknown parameters, turns failures into `isError` results with fixed categories
+  (`errors.py`, design 7.5: `"<category>: <hint>"`, optionally the argument *name*), and writes
+  the one audit line from the note. A send wrapper scrubs SDK JSON-RPC error bodies; `mcp.*` loggers are at WARNING
+  with a filter that strips arguments and tracebacks (re-applied after the first request). `tools/list` scope filtering is EML-005.
+- **Audit (`audit.py`):** one JSON line per `tools/call` (`mail.audit`), built from an allowlist of
+  keys: `event`, `ts`, `client_id`, `auth`, `tool` (`unknown` for a bad name), `account` (a
+  configured alias or `*`; `list_accounts` logs `*`), `status` `ok`/`error`/`denied`/`partial`,
+  optional `error_class` (a category, `unknown_tool`, `unknown_parameter`, `protocol`, or an
+  exception type name), `ms`, `accounts_ok`/`accounts_skipped`. Per-call values come from the
+  service: `audit.note_call(account=<validated alias>, accounts_ok=, accounts_skipped=,
+  partial=True)` writes into the open note (a no-op outside a call); `partial` turns `ok` into
+  status `partial`, never a failure. Never subjects, bodies,
+  addresses, search text, ids, argument values, tokens or keys. No audit line for failed auth.
+  Log group `/aws/lambda/<FunctionName>`, retention `LogRetentionDays` (400), retained on stack
+  deletion.
+- **AWS clients:** SSM and Secrets Manager clients share `ssm_params.aws_client_config()`: 2 s
+  connect, 3 s read, 2 attempts in total.
+- **IAM:** an explicit role (`MailFunctionRole`, not SAM's basic execution role):
+  `logs:CreateLogStream`/`PutLogEvents` on the function's own log group only; `ssm:GetParameter` on
+  `<prefix>/*`; `kms:Decrypt` via SSM on `alias/aws/ssm` only; `secretsmanager:GetSecretValue` on
+  the one secret ARN.
+- **Not built yet:** sanitiser (EML-003a), `ImapBackend` and read tools (EML-003b), drafts
+  (EML-004), Cognito and RFC 9728 metadata (EML-005).
+
+## Dependencies
+- `src/requirements.in` is the source (fastapi, mangum, pydantic, mcp; boto3 comes from the Lambda
+  runtime); `src/requirements.txt` is the hashed lock for the Lambda target. Regenerate, then audit:
+  `uv pip compile src/requirements.in --generate-hashes --python-version 3.12 --python-platform aarch64-manylinux2014 -o src/requirements.txt`
+  `uvx pip-audit -r src/requirements.txt --require-hashes --no-deps --disable-pip`
+- `requirements-dev.txt` includes `src/requirements.in` plus boto3, httpx and pytest. The local
+  venv is x86_64; only the Lambda artifact is arm64.
+- `imapclient` is added by EML-003b, not before.
+
+## Testing
+- Setup: `~/.pyenv/versions/3.12.9/bin/python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt`
+- Run: `.venv/bin/python -m pytest` (SSM, Secrets Manager and the mail backend are faked; no network).
+- Template: `sam validate --lint` and `sam build` (with Python 3.12 on `PATH`); the build must be
+  arm64 only.
+- No CI yet: the local pytest run is the gate.
+- `test_service.py::test_every_tool_declares_its_scopes` compares the registered MCP tools with
+  `TOOL_SCOPES`: a new tool needs an entry there.

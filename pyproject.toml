@@ -7,3 +7,6 @@ requires-python = ">=3.12,<3.13"
 testpaths = ["tests"]
 pythonpath = ["src", "tests"]
 addopts = "-q"
+filterwarnings = [
+    "ignore:There is no current event loop:DeprecationWarning",
+]

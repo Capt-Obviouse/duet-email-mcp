@@ -1,0 +1,26 @@
+# Copy to samconfig.toml (gitignored) and edit: region, profile and your mailboxes.
+version = 0.1
+
+[default.global.parameters]
+stack_name = "duet-email-mcp"
+
+[default.build.parameters]
+cached = true
+
+[default.deploy.parameters]
+stack_name = "duet-email-mcp"
+region = "us-east-1"  # any region
+profile = "<your-profile>"  # or remove to use the default profile
+resolve_s3 = true
+s3_prefix = "duet-email-mcp"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+fail_on_empty_changeset = false
+tags = "project=\"duet-email-mcp\""
+# Accounts and ClientLimits become the SSM parameters <prefix>/accounts and <prefix>/client-limits.
+# A literal ('...') TOML string keeps the JSON readable: inside it, escape each JSON quote as \".
+# App passwords never go here: put them in the <stack name>/mailbox-credentials secret.
+# Example with one Gmail account, the API key allowed to draft:
+#   Accounts="{\"personal\": {\"provider\": \"google\", \"address\": \"me@example.com\"}}"
+#   ClientLimits="{\"api-key\": {\"access\": \"draft\"}}"
+parameter_overrides = 'Accounts="{}" ClientLimits="{}" EnableApiKey="true"'
