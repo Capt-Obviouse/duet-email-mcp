@@ -245,3 +245,63 @@ def test_config_is_cached_per_ttl():
     ssm.values[ACCOUNTS_PARAM] = "{}"  # the kill switch: removing the account
     now[0] = 61
     assert access.grant(API_KEY_CLIENT_ID, ALL_SCOPES).accounts == ()
+
+
+# ---------------------------------------------------------------- shapes that once raised TypeError/ValueError
+
+HUGE_INT = "9" * 5000  # json refuses integers of over 4300 digits with ValueError
+
+ACCOUNT_PROBES = [
+    json.dumps({"personal": {"provider": ["google"], "address": "me@example.com"}}),
+    json.dumps({"personal": {"provider": {"g": 1}, "address": "me@example.com"}}),
+    accounts_with(imap={"host": "imap.example.com", "tls": ["implicit"]}),
+    '{"personal": ' + HUGE_INT + "}",
+]
+LIMIT_PROBES = [
+    json.dumps({"api-key": {"access": ["read"]}}),
+    json.dumps({"api-key": {"access": {"read": 1}}}),
+    '{"api-key": ' + HUGE_INT + "}",
+]
+
+
+@pytest.mark.parametrize("raw", ACCOUNT_PROBES)
+def test_probe_accounts_raise_invalid_parameter(raw):
+    with pytest.raises(InvalidParameter):
+        parse_accounts(raw)
+
+
+@pytest.mark.parametrize("raw", LIMIT_PROBES)
+def test_probe_limits_raise_invalid_parameter(raw):
+    with pytest.raises(InvalidParameter):
+        parse_client_limits(raw)
+
+
+@pytest.mark.parametrize("accounts_raw, limits_raw", [
+    *[(raw, "{}") for raw in ACCOUNT_PROBES],
+    *[(json.dumps(ACCOUNTS), raw) for raw in LIMIT_PROBES],
+])
+def test_probe_shapes_deny_log_once_and_are_cached(accounts_raw, limits_raw, caplog):
+    ssm = FakeSSM({ACCOUNTS_PARAM: accounts_raw, LIMITS_PARAM: limits_raw})
+    access = AccountAccess(PREFIX, ParameterReader(fetch=ssm))
+    with caplog.at_level(logging.ERROR):
+        for _ in range(3):
+            assert access.grant(API_KEY_CLIENT_ID, ALL_SCOPES).accounts == ()
+    assert sum("unparsable" in r.getMessage() for r in caplog.records) == 1
+    assert ssm.calls.count(LIMITS_PARAM) == 1  # the negative result is cached, not re-read per call
+    assert ssm.calls.count(ACCOUNTS_PARAM) <= 1
+
+
+@pytest.mark.parametrize("exc", [TypeError("canary-value"), ValueError("canary-value"), RecursionError()])
+def test_loaders_deny_any_parse_error_without_its_text(monkeypatch, exc, caplog):
+    def boom(raw):
+        raise exc
+
+    from app import accounts as accounts_module
+
+    monkeypatch.setattr(accounts_module, "parse_accounts", boom)
+    monkeypatch.setattr(accounts_module, "parse_client_limits", boom)
+    access = AccountAccess(PREFIX, ParameterReader(fetch=FakeSSM({ACCOUNTS_PARAM: "{}", LIMITS_PARAM: "{}"})))
+    with caplog.at_level(logging.ERROR):
+        assert access.accounts() == {}
+        assert access.client_limits() is None
+    assert "malformed" in caplog.text and "canary-value" not in caplog.text

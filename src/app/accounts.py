@@ -168,10 +168,10 @@ def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def _loads(raw: str) -> Any:
     try:
         return json.loads(raw, object_pairs_hook=_no_duplicate_keys)
-    except json.JSONDecodeError:
-        raise InvalidParameter("not valid JSON") from None
     except RecursionError:
         raise InvalidParameter("nested too deeply") from None
+    except ValueError:  # not JSON, or a number json refuses (e.g. an integer of over 4300 digits)
+        raise InvalidParameter("not valid JSON") from None
 
 
 def _object(value: Any, allowed: frozenset[str], what: str) -> dict[str, Any]:
@@ -210,7 +210,7 @@ def _port(value: Any, what: str) -> int:
 
 
 def _tls(value: Any, what: str) -> str:
-    if value not in TLS_MODES:
+    if not isinstance(value, str) or value not in TLS_MODES:
         raise InvalidParameter(f"{what} tls must be \"implicit\" or \"starttls\"")
     return value
 
@@ -258,7 +258,7 @@ def _parse_account(alias: str, entry: Any) -> Account:
     if not is_alias(alias):
         raise InvalidParameter("an account alias must match " + ALIAS_PATTERN)
     entry = _object(entry, ACCOUNT_FIELDS, "an account entry")
-    if "provider" not in entry or entry["provider"] not in PROVIDER_ALIASES:
+    if not isinstance(entry.get("provider"), str) or entry["provider"] not in PROVIDER_ALIASES:
         raise InvalidParameter("provider must be one of: " + ", ".join(PROVIDER_ALIASES))
     provider = PROVIDER_ALIASES[entry["provider"]]
     preset = PRESETS[provider]
@@ -303,7 +303,7 @@ def _parse_limit(entry: Any) -> ClientLimit:
             raise InvalidParameter("accounts must be a JSON array of account aliases")
         accounts = tuple(dict.fromkeys(items))
     access = entry.get("access")
-    if "access" in entry and access not in ACCESS_SCOPES:
+    if "access" in entry and (not isinstance(access, str) or access not in ACCESS_SCOPES):
         raise InvalidParameter("access must be \"read\" or \"draft\" when present")
     return ClientLimit(accounts=accounts, access=access)
 
@@ -355,12 +355,21 @@ def effective_scopes(
 
 # ------------------------------------------------------------------ cached view over SSM
 
+# Anything a parser can raise for a malformed document. The loaders deny on all of them and
+# return a value, so the reader caches the negative result like any other (no re-read per call).
+_PARSE_ERRORS = (InvalidParameter, TypeError, ValueError, RecursionError)
+
+
+def _problem(exc: Exception) -> str:
+    """Our fixed parser text, or a fixed word for anything else (whose text could carry a value)."""
+    return str(exc) if isinstance(exc, InvalidParameter) else "malformed"
+
 
 def _load_accounts(raw: str | None) -> dict[str, Account]:
     try:
         accounts = parse_accounts(raw)
-    except InvalidParameter as exc:
-        logger.error("account config: %s is unparsable (%s); no mailbox is usable", ACCOUNTS_PARAM, exc)
+    except _PARSE_ERRORS as exc:
+        logger.error("account config: %s is unparsable (%s); no mailbox is usable", ACCOUNTS_PARAM, _problem(exc))
         return {}
     if not accounts:
         logger.error("account config: %s is missing or empty; no mailbox is usable", ACCOUNTS_PARAM)
@@ -373,8 +382,10 @@ def _load_limits(raw: str | None) -> dict[str, ClientLimit] | None:
         return None
     try:
         return parse_client_limits(raw)
-    except InvalidParameter as exc:
-        logger.error("account config: %s is unparsable (%s); all mailbox access is denied", CLIENT_LIMITS_PARAM, exc)
+    except _PARSE_ERRORS as exc:
+        logger.error(
+            "account config: %s is unparsable (%s); all mailbox access is denied", CLIENT_LIMITS_PARAM, _problem(exc)
+        )
         return None
 
 
