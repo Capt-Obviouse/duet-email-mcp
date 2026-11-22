@@ -6,7 +6,7 @@ Live prioritized list until the GitHub repo and Issues exist. Specs live in
 | Order | ID | Title | Layer | Est | Pri | Status | Owner |
 |-------|----|-------|-------|-----|-----|--------|-------|
 | 1 | EML-001 | Spike: architecture and threat model (IMAP on Lambda, multi-account fan-out, prompt-injection handling, credentials, Cognito reuse, cost) | architect | M | P1 | Done (design in `docs/architecture/EML-001-architecture.md`; operator decisions A589, A590, A591 recorded 2026-11-19) | Architect |
-| 2 | EML-002 | Skeleton: FastAPI + Mangum + SAM, `/health`, stateless MCP at `/mcp`, API-key seam (read-only by default), account/limit parsers (fail closed), `MailBackend` + fake, Secrets Manager seam, `list_accounts`, audit line from day one | backend, infra | L | P1 | Ready | Developer |
+| 2 | EML-002 | Skeleton: FastAPI + Mangum + SAM, `/health`, stateless MCP at `/mcp`, API-key seam (read-only by default), account/limit parsers (fail closed), `MailBackend` + fake, Secrets Manager seam, `list_accounts`, audit line from day one | backend, infra | L | P1 | In review (spec `docs/planning/stories/EML-002.md`) | Developer |
 | 3 | EML-003a | Sanitiser: Unicode stripping, HTML-to-text, untrusted-content fence, header sanitising, id parser, argument validators (pure code, fixtures, fuzz) | backend | M | P1 | After EML-002 | Developer |
 | 4 | EML-003b | `ImapBackend` (imapclient), connection cache, circuit breaker, `search_messages`, `get_message`, fan-out and deadline | backend | L | P1 | After EML-003a | Developer, Security |
 | 5 | EML-003c | Live gate on the deployed function: Gmail, Workspace, iCloud (latency, cloud-IP login, folder names, search charset) | cross-cutting | S | P1 | After EML-003b | Developer, Operator |

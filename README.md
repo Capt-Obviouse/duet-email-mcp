@@ -4,8 +4,9 @@ An MCP server that lets an AI assistant (Claude.ai, Claude Code, or any MCP clie
 draft email across **several of your own mailboxes at once**, over plain IMAP/SMTP with
 per-account app passwords. Runs serverless on AWS Lambda, deployed with AWS SAM.
 
-Status: **planning**. Nothing is deployable yet; see `CLAUDE.md` for the design decisions and
-`docs/project-management/BACKLOG.md` for the plan.
+Status: **early development**. The skeleton (auth, account configuration, credentials seam,
+audit log and the `list_accounts` tool) exists; reading mail does not yet. See `CLAUDE.md` for
+the design decisions and `docs/project-management/BACKLOG.md` for the plan.
 
 Planned:
 - Any provider that supports IMAP with an app password (Gmail with 2-Step Verification, iCloud
