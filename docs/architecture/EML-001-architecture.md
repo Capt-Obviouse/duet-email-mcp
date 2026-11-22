@@ -9,9 +9,9 @@ or RFC documentation but not re-checked now; **[A]** assumed, to be settled by a
 17 lists each one with the story that settles it).
 
 The founding decisions 1 to 12 in `CLAUDE.md` are locked. This document designs inside them and
-resolves the points they leave to EML-001. Three items need the operator and are filed as asks:
-A589 (Cognito pool), A590 (send), A591 (secret layout). The sections concerned say "pending
-operator decision" and carry the recommendation as the working assumption.
+resolves the points they leave to EML-001. Three items needed the operator and were decided on
+2026-11-19: A589 (Cognito pool: optional reuse of an existing pool), A590 (draft-only, no send
+tool planned), A591 (one JSON secret). The sections concerned record each as "Decided".
 
 ## 1. Summary of decisions
 
@@ -23,13 +23,13 @@ operator decision" and carry the recommendation as the working assumption.
 | 4 | Lambda | arm64, Python 3.12, **1024 MB**, 30 s timeout, reserved concurrency 5, **no VPC** |
 | 5 | Fan-out | Per-mailbox budget, overall 20 s deadline for searches, partial results with `truncated` and per-account `skipped` reasons |
 | 6 | Account config | One stack-created SSM String parameter `<prefix>/accounts` (JSON, no secrets). Its keys are the allowlist (decision 9). Client limits in `<prefix>/client-limits`, narrowing only |
-| 7 | Credentials | **One JSON secret** in Secrets Manager, alias to app password, created empty by the stack, filled by CLI. Pending operator decision A591 |
+| 7 | Credentials | **One JSON secret** in Secrets Manager, alias to app password, created empty by the stack, filled by CLI. Decided (A591) |
 | 8 | Tools | `list_accounts` (no network), `search_messages`, `get_message`, then `create_draft`. Read tools use `EXAMINE` and `BODY.PEEK` so nothing is marked read |
 | 9 | Message id | `<alias>.<folder>.<uidvalidity>.<uid>`, folder is a logical name (`inbox`, `sent`, `drafts`, `all_mail`). A UIDVALIDITY mismatch returns `stale_id`. Not stable across folders; the RFC `Message-ID` header is returned for cross-folder lookup |
 | 10 | Search | Structured filters map to IMAP `SEARCH`; on Google accounts `X-GM-RAW` is used when the server advertises `X-GM-EXT-1`, with the `SEARCH` mapping as fallback |
 | 11 | Untrusted content | Text only. Stdlib `HTMLParser` stripper, invisible-Unicode removal, random-nonce fence around every body, header sanitising, caps, attachment metadata only, server instructions text in section 9 |
-| 12 | Auth | API-key seam now (read-only by default for the key client), then Cognito per the sibling design. **Own pool per stack, standalone** (recommended; pending A589) |
-| 13 | Send | Ship draft-only. Reserve seams (optional `smtp` config block, one RFC 5322 builder, scope name `mail.send` unused). If ever added: `send_draft(draft_id)` only, never free-form send. Pending A590 |
+| 12 | Auth | API-key seam now (read-only by default for the key client), then Cognito per the sibling design. **Own pool by default; optional `ExistingUserPoolId` reuses an existing pool** (decided, A589) |
+| 13 | Send | Ship draft-only. Reserve seams (optional `smtp` config block, one RFC 5322 builder, scope name `mail.send` unused). `send_draft` is not planned (decided, A590); revisit only if the operator raises it, and then `send_draft(draft_id)` only, never free-form send |
 | 14 | Audit | Added in EML-002, not EML-006: one JSON line per tool call from the first tool |
 | 15 | Cost | About 0.40 USD per month without Cognito, about 0.70 to 1.00 with it, at light personal use (section 14) |
 
@@ -260,7 +260,7 @@ JSON `{"<client_id>": {"accounts": ["personal-gmail"], "access": "read"}}`, defa
   `allowed=` keyword to every backend method, which checks again (defence in depth, as in the
   calendar bridge). The credentials map is read by alias only for aliases that passed both checks.
 
-## 6. Credentials (pending operator decision A591)
+## 6. Credentials (decided, A591: one JSON secret)
 
 | Criterion | One JSON secret | One secret per mailbox |
 |-----------|-----------------|------------------------|
@@ -507,7 +507,7 @@ lifetime a template parameter (default 8 h, max 24). TOTP MFA on for the human u
 MCP-003l). **Scope semantics:** `mail.draft` does not imply `mail.read`; `create_draft` with
 `in_reply_to` needs both.
 
-### 10.3 Own pool per stack or reuse an existing pool (pending operator decision A589)
+### 10.3 Own pool per stack or reuse an existing pool (decided, A589: optional reuse)
 
 | Aspect | Own pool per stack | Optional reuse (`ExistingUserPoolId`) |
 |--------|--------------------|----------------------------------------|
@@ -520,17 +520,39 @@ MCP-003l). **Scope semantics:** `mail.draft` does not imply `mail.read`; `create
 | Cost | No per-pool charge; M2M requests cost the same wherever they happen | Same; no saving [K] |
 | Template complexity | Already designed and proven in the sibling | `Conditions` around every pool resource, extra IAM, cross-stack documentation |
 
-**Recommendation: own pool per stack in the first release.** Standalone is a hard requirement of
-the public template, isolation is the safer default for the more sensitive service, and reuse saves
-only one login. Keep the verifier pool-agnostic (pool id from an environment variable, scope and
-live-client checks as designed) so a later `ExistingUserPoolId` parameter is a template-only change
-(estimate S to M) if the operator wants the single sign-in. Until A589 is answered EML-005 is
-planned for an own pool.
+**Decided (A589): own pool by default, optional reuse of an existing pool.** The template gets an
+optional `ExistingUserPoolId` parameter (plus the existing pool's domain parameter).
 
-## 11. Draft-only or send (pending operator decision A590)
+- **Empty (the public default):** the stack creates its own pool, resource server and clients and
+  works standalone, as designed above.
+- **Set:** the stack creates no pool. It adds its own resource server (`mail.read`, `mail.draft`)
+  and its own app clients to the existing pool. An operator who already runs a sibling MCP stack can
+  point at its pool and sign in once for both services.
+- **Shared:** only the pool. The Lambda function, IAM role, secrets, SSM parameters and Function
+  URL stay separate per stack.
+- **Verifier:** stays pool-agnostic (pool id from an environment variable; scope and live-client
+  checks as designed), so both modes use the same code.
 
-Decision 5 already stages `send_message` behind `mail.send`. The question is whether to plan for it.
-Recommendation: **ship draft-only; do not build send in the first release; keep it cheap to add.**
+Caveats to document in the public README and the template parameter description:
+1. **Dependency on the pool-owning stack.** It must be deployed first, and deleting or replacing it
+   breaks login for this stack.
+2. **Pool-wide settings are shared** (MFA, password policy, token validity). MFA must stay
+   required; one service's needs constrain the other.
+3. **Isolation rests on scopes.** Scopes are URL-prefixed per resource server, so a client granted
+   only email scopes cannot call the sibling service and vice versa. Every email client must be
+   granted only `mail.*` scopes.
+4. **Client-set check is weaker evidence.** `ListUserPoolClients` returns every client in the pool;
+   the per-tool scope check carries the isolation.
+5. **Concurrent changes** to one pool from two stacks can race [A]; deploy them one at a time.
+
+Template cost: `Conditions` around the pool resources, extra IAM for the shared-pool case and
+cross-stack documentation (estimate S to M, folded into EML-005).
+
+## 11. Draft-only or send (decided, A590: draft-only)
+
+Decision 5 already stages `send_message` behind `mail.send`. **Decided (A590): draft-only.** No send
+tool is planned; `send_draft` is not planned and is revisited only if the operator raises it. The
+seams below stay reserved so adding it later remains cheap.
 
 What to build now so send is cheap later:
 1. `smtp` block reserved and validated in the account schema, with preset values (Gmail
@@ -638,7 +660,7 @@ No NAT gateway, no VPC, no WAF, no provisioned concurrency.
 | R9 | Slow `TEXT` search on huge non-Google mailboxes hits the per-mailbox timeout | Medium / Low | Partial results; note advising narrower filters |
 | R10 | Gmail bandwidth and connection quotas on heavy use [K] | Low / Low | Header-only list calls, caps |
 
-Open items for the operator: A589 (pool), A590 (send), A591 (secret layout). Open item for the
+No open operator items: A589 (optional pool reuse), A590 (draft-only) and A591 (one JSON secret) were decided on 2026-11-19. Open item for the
 orchestrator: whether to create the throwaway test labels and a test message in each live mailbox
 for EML-003c (operator action).
 
@@ -667,9 +689,9 @@ Order: 002, 003a, 003b, 003c, 004, 005, 006 (003a has no dependency beyond 002's
 | EML-003b | | L | `ImapBackend` (imapclient), connection cache, circuit breaker, folder resolution, `search_messages`, `get_message`, fan-out and deadline, Dovecot integration tests |
 | EML-003c | | S | Live gate on the deployed function against Gmail, Workspace and iCloud, results into this document (section 17). Security review after |
 | EML-004 | M | M | `create_draft` with idempotent Message-ID, builder, Drafts resolution, live APPEND test on all three providers, Security review |
-| EML-005 | L | L | Cognito own pool (per A589), per-tool scope enforcement in from the start, `EnableApiKey` default off, live Claude.ai handshake gate first, then headless client |
+| EML-005 | L | L | Cognito: own pool by default, optional `ExistingUserPoolId` reuse (A589), per-tool scope enforcement in from the start, `EnableApiKey` default off, live Claude.ai handshake gate first, then headless client |
 | EML-006 | L | L | Operator helper scripts (set or rotate a password), log-canary and injection test set, Security review of the whole stack, Launch Stack one-click, public README (provider setup per section 5.2, admin-console steps for Workspace, token caching advice, T1/T5 warning), teardown including the secret |
-| EML-0xx | idea | `send_draft` (only after A590 says yes) | per section 11 |
+| EML-0xx | not planned | `send_draft` (draft-only per A590; revisit only if the operator raises it) | per section 11 |
 
 Outlines of new or changed specs (write with `TEMPLATE.md` when the PM grooms them):
 
