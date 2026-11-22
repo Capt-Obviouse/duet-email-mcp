@@ -30,7 +30,10 @@ def test_no_caller_or_no_scope_is_forbidden():
 
 
 def test_every_tool_declares_its_scopes():
-    assert set(TOOL_SCOPES) == {"list_accounts"}
+    from app.mcp_server import build_server  # imports the SDK
+
+    server = build_server(service())
+    assert set(server.tool_parameters) == set(TOOL_SCOPES)
 
 
 def test_no_backend_yet_is_unavailable():

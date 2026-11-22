@@ -131,3 +131,76 @@ def test_reason_code_only_passes_short_literals():
     assert audit.reason_code("bad_api_key") == "bad_api_key"
     assert audit.reason_code("Has Spaces") == "other"
     assert audit.reason_code(None) is None
+
+
+# ---------------------------------------------------------------- per-call note (W3)
+
+
+def stub_server():
+    from app.credentials import CredentialStore
+    from app.mcp_server import build_server
+    from app.service import MailService
+
+    server = build_server(MailService(None, CredentialStore(""), lambda: None))  # type: ignore[arg-type]
+
+    def fan_out() -> dict:
+        audit.note_call(account=audit.ALL_ACCOUNTS, accounts_ok=2, accounts_skipped=1, partial=True)
+        return {"n": 1}
+
+    async def one_account() -> dict:
+        audit.note_call(account="personal")
+        return {"n": 1}
+
+    def fails_after_noting() -> dict:
+        audit.note_call(account="personal", partial=True)
+        raise RuntimeError("canary-value")
+
+    for fn in (fan_out, one_account, fails_after_noting):
+        server.add_tool(fn, structured_output=False)
+    return server
+
+
+def run_tool(server, name):
+    import asyncio
+
+    with audit.caller(API_KEY_TOKEN):
+        try:
+            return asyncio.run(server.call_tool(name, {}))
+        except Exception as exc:  # noqa: BLE001 - the tool error is what we expect for one stub
+            return exc
+
+
+def test_service_note_fills_the_one_audit_line(logs):
+    server = stub_server()
+    run_tool(server, "fan_out")
+    run_tool(server, "one_account")
+    run_tool(server, "fails_after_noting")
+    lines = audit_lines(logs)
+    assert [(l["tool"], l.get("account"), l["status"], l.get("error_class")) for l in lines] == [
+        ("fan_out", "*", "partial", None),
+        ("one_account", "personal", "ok", None),
+        ("fails_after_noting", "personal", "error", "RuntimeError"),  # a failure is never "partial"
+    ]
+    assert lines[0]["accounts_ok"] == 2 and lines[0]["accounts_skipped"] == 1
+    assert "accounts_ok" not in lines[1]
+    assert all(set(l) <= ALLOWED_KEYS for l in lines)
+    assert "canary-value" not in app_text(logs)
+
+
+def test_note_does_not_leak_between_calls(logs):
+    server = stub_server()
+    run_tool(server, "fan_out")
+    run_tool(server, "one_account")
+    second = audit_lines(logs)[1]
+    assert second["status"] == "ok" and "accounts_skipped" not in second
+
+
+def test_note_call_outside_a_tool_call_is_a_no_op():
+    audit.note_call(account="personal", partial=True)  # must not raise
+
+
+def test_final_outcome():
+    note = audit.AuditNote(partial=True)
+    assert audit.final_outcome(audit.OK, note) == ("partial", None)
+    assert audit.final_outcome(("denied", "forbidden"), note) == ("denied", "forbidden")
+    assert audit.final_outcome(audit.OK, audit.AuditNote()) == audit.OK

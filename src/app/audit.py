@@ -15,6 +15,12 @@ A line looks like::
   exception's type name. Never a message.
 - Fan-out calls add the counts ``accounts_ok`` and ``accounts_skipped`` (EML-003b).
 
+Per-call values come from an ``AuditNote``: ``MailMCPServer.call_tool`` opens one per call
+(``call_note``) with the tool's default ``account``, and ``MailService`` fills it through
+``note_call`` with the validated alias it addressed, the fan-out counts and ``partial``. The note
+is a mutable object held in a ``ContextVar``, so a tool running in a worker thread (which gets a
+copy of the context) still writes to the same note, and ``call_tool`` writes the one line.
+
 Never subjects, bodies, addresses, search text, message ids, filenames, folder names, argument
 values, tokens or keys. ``record`` builds the line from an allowlist of keys, so a new field
 cannot leak in by accident. Failed authentication is not a call: it shows only in the access line.
@@ -30,6 +36,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from pydantic import ValidationError
@@ -101,6 +108,59 @@ def caller(verified: VerifiedToken) -> Iterator[None]:
 
 def current_caller() -> VerifiedToken | None:
     return _caller.get()
+
+
+# ------------------------------------------------------------------ per-call note (service -> line)
+
+
+@dataclass
+class AuditNote:
+    """What the service learned during one call. ``account`` is a configured alias or ``*``."""
+
+    account: str | None = None
+    accounts_ok: int | None = None
+    accounts_skipped: int | None = None
+    partial: bool = False
+
+
+_note: ContextVar[AuditNote | None] = ContextVar("mail_audit_note", default=None)
+
+
+@contextmanager
+def call_note(account: str | None = None) -> Iterator[AuditNote]:
+    """Opens the note for one tool call (``MailMCPServer.call_tool``)."""
+    note = AuditNote(account=account)
+    reset = _note.set(note)
+    try:
+        yield note
+    finally:
+        _note.reset(reset)
+
+
+def note_call(
+    *,
+    account: str | None = None,
+    accounts_ok: int | None = None,
+    accounts_skipped: int | None = None,
+    partial: bool | None = None,
+) -> None:
+    """Records per-call audit values; a no-op outside a tool call. Pass only validated aliases."""
+    note = _note.get()
+    if note is None:
+        return
+    if account is not None:
+        note.account = account
+    if accounts_ok is not None:
+        note.accounts_ok = accounts_ok
+    if accounts_skipped is not None:
+        note.accounts_skipped = accounts_skipped
+    if partial is not None:
+        note.partial = partial
+
+
+def final_outcome(outcome: Outcome, note: AuditNote) -> Outcome:
+    """``partial`` replaces ``ok`` when the service marked the call partial; failures stand."""
+    return (STATUS_PARTIAL, None) if outcome == OK and note.partial else outcome
 
 
 # ------------------------------------------------------------------ the line

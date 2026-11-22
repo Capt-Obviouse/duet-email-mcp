@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.mcp_server import SERVER_INSTRUCTIONS
-from conftest import ACCEPT, ACCOUNTS, LIMITS_PARAM, TEST_KEY, FakeSSM, call, make_app, rpc
+from conftest import ACCEPT, ACCOUNTS, API_KEY_PARAM, LIMITS_PARAM, TEST_KEY, FakeSSM, call, make_app, rpc
 
 INIT = {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}
 
@@ -137,3 +138,37 @@ def test_protocol_errors_are_scrubbed(client):
     r = client.post("/mcp", content=b"{not json canary-value",
                     headers={"X-API-Key": TEST_KEY, "Content-Type": "application/json", **ACCEPT})
     assert "canary-value" not in r.text
+
+
+# ---------------------------------------------------------------- failures end to end
+
+
+def test_ssm_failure_for_accounts_or_limits_is_forbidden_over_http(caplog):
+    class FailingSSM(FakeSSM):
+        def __call__(self, name):
+            if name != API_KEY_PARAM:
+                self.calls.append(name)
+                raise RuntimeError("AccessDenied canary-value")
+            return super().__call__(name)
+
+    client = TestClient(make_app(FailingSSM()))
+    with caplog.at_level(logging.INFO):
+        assert err(client, "list_accounts").startswith("forbidden:")
+    audit_line = [json.loads(r.getMessage()) for r in caplog.records if r.name == "mail.audit"][0]
+    assert audit_line["status"] == "denied" and audit_line["account"] == "*"
+    assert "canary-value" not in caplog.text
+
+
+def test_unexpected_exception_still_writes_the_audit_line(caplog):
+    app = make_app()
+
+    def boom(caller):
+        raise RuntimeError("canary-value")
+
+    app.state.deps.service.list_accounts = boom
+    with caplog.at_level(logging.INFO):
+        assert err(TestClient(app), "list_accounts") == "internal error"
+    lines = [json.loads(r.getMessage()) for r in caplog.records if r.name == "mail.audit"]
+    assert len(lines) == 1
+    assert (lines[0]["status"], lines[0]["error_class"]) == ("error", "RuntimeError")
+    assert "canary-value" not in "\n".join(r.getMessage() for r in caplog.records)

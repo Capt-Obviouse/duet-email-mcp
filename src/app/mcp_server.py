@@ -111,7 +111,7 @@ class MailMCPServer(MCPServer):
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self.tool_parameters: dict[str, tuple[str, ...]] = {}
-        self.tool_accounts: dict[str, str] = {}  # tool -> fixed audit ``account`` value
+        self.tool_accounts: dict[str, str] = {}  # tool -> default audit ``account`` (the service may set it)
 
     def add_tool(self, fn: Any, *args: Any, audit_account: str | None = None, **kwargs: Any) -> None:  # type: ignore[override]
         super().add_tool(fn, *args, **kwargs)
@@ -123,6 +123,12 @@ class MailMCPServer(MCPServer):
     async def call_tool(self, name: str, arguments: dict[str, Any], context: Any = None) -> Any:
         started = time.perf_counter()
         tool = name if name in self.tool_parameters else audit.UNKNOWN_TOOL
+        with audit.call_note(self.tool_accounts.get(tool)) as note:
+            return await self._call_and_record(name, tool, arguments, context, started, note)
+
+    async def _call_and_record(
+        self, name: str, tool: str, arguments: dict[str, Any], context: Any, started: float, note: audit.AuditNote
+    ) -> Any:
         outcome: audit.Outcome = (audit.STATUS_ERROR, "internal")  # if anything escapes below
         try:
             if name not in self.tool_parameters:
@@ -144,7 +150,10 @@ class MailMCPServer(MCPServer):
             outcome = audit.OK
             return result
         finally:
-            audit.record(_caller(), tool, outcome, started, account=self.tool_accounts.get(tool))
+            audit.record(
+                _caller(), tool, audit.final_outcome(outcome, note), started,
+                account=note.account, accounts_ok=note.accounts_ok, accounts_skipped=note.accounts_skipped,
+            )
 
 
 def error_message(tool: str, exc: BaseException) -> str:
@@ -264,6 +273,7 @@ class StatelessMCPEndpoint:
 
     def __init__(self, server: MCPServer):
         self.server = server
+        self._logging_rechecked = False
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["method"] != "POST":
@@ -280,8 +290,13 @@ class StatelessMCPEndpoint:
             stateless_http=True, json_response=True, transport_security=_TRANSPORT_SECURITY
         )
         manager = self.server.session_manager
-        async with manager.run():
-            await manager.handle_request(scope, receive, _scrubbing_send(send))
+        try:
+            async with manager.run():
+                await manager.handle_request(scope, receive, _scrubbing_send(send))
+        finally:
+            if not self._logging_rechecked:  # SDK loggers created during the first request
+                self._logging_rechecked = True
+                quiet_mcp_logging()
 
 
 # ---------------------------------------------------------------------------- logging
